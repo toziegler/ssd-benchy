@@ -24,7 +24,7 @@ use std::{
     ops::Range,
     os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -64,6 +64,11 @@ struct CliConfig {
     #[clap(long, default_value_t = false)]
     serialize_samples: bool,
 
+    /// Forces the threads to write roughly at the same time creating a micro spike but still
+    /// maintains the rate
+    #[clap(long, default_value_t = false)]
+    spiky: bool,
+
     /// Name of the SSD device, e.g., /dev/md0; must be the real name of the block device and not an alias
     #[clap(long)]
     ssd_device: String,
@@ -98,6 +103,7 @@ struct BenchmarkConfig {
     utilization_iop: f64, // single measurement point
     use_fsync: bool,
     uuid: u128,
+    spiky: bool,
 }
 
 impl BenchmarkConfig {
@@ -124,6 +130,7 @@ impl BenchmarkConfig {
             iops: (iops_utilization * config.max_iops as f64) as u64,
             use_fsync: config.use_fsync,
             uuid,
+            spiky: config.spiky,
         }
     }
 }
@@ -179,11 +186,16 @@ struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new(rate: f64, threads: u64, thread_id: u64) -> Self {
+    pub fn new(rate: f64, threads: u64, thread_id: u64, spiky: bool) -> Self {
         let rate_per_thread = rate / threads as f64;
         let inter_arrival_time = 1e6 / rate_per_thread; // microseconds
-        let inter_arrival_time_offset = (inter_arrival_time / threads as f64) * thread_id as f64;
-        let next_time = Instant::now() + Duration::from_micros(inter_arrival_time_offset as u64);
+        let mut inter_arrival_time_offset =
+            (inter_arrival_time / threads as f64) * thread_id as f64;
+        if spiky {
+            inter_arrival_time_offset = 0.0; // forces threads to start at roughly the same time
+        }
+        let next_time = Instant::now()
+            + Duration::from_micros(inter_arrival_time_offset as u64 + inter_arrival_time as u64);
 
         RateLimiter {
             inter_arrival_time,
@@ -201,6 +213,7 @@ impl RateLimiter {
             time_span = next.duration_since(current);
         }
     }
+
     pub fn run<F: FnMut()>(&mut self, mut action: F, mut sampling: impl FnMut(u128)) {
         self.next_time = self.next_time + Duration::from_micros(self.inter_arrival_time as u64);
         let diff = (Instant::now() - self.next_time).as_nanos();
@@ -275,19 +288,24 @@ fn main() {
     let config: &'static CliConfig = Box::leak(Box::new(CliConfig::parse()));
 
     if config.preinitialize {
+        println!("Initializing SSDs ... ");
         initialize_ssd(&config.ssd_device, config.capacity_fraction);
+        println!(" [Done]");
+    } else {
+        println!("No preinitialize");
     }
+
     let initialized_blocks = (get_device_capacity(&config.ssd_device).unwrap() as f64
         * config.capacity_fraction) as u64
         / BLOCK_SIZE as u64;
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(config.writer_threads as usize));
-
     for utilization in config.utilization_iops.iter() {
         let uuid = Uuid::new_v4();
+        // TODO: atomic counter
+        let barrier_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let threads: Vec<_> = (0..config.writer_threads)
             .map(|worker_id| {
-                let barrier = barrier.clone();
+                let barrier_counter = barrier_counter.clone();
                 std::thread::spawn(move || {
                     let flags = O_RDWR | O_DIRECT;
                     let ssd_path = format!("/dev/{}", config.ssd_device);
@@ -304,11 +322,21 @@ fn main() {
                     let mut block_current = range.start;
                     let mut operations = 0;
 
-                    //------ barrier
-                    barrier.wait();
+                    barrier_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                    let mut ratelimiter =
-                        RateLimiter::new(write_rate, config.writer_threads, worker_id);
+                    while barrier_counter.load(std::sync::atomic::Ordering::SeqCst)
+                        != config.writer_threads
+                    {
+                        // spin
+                        std::hint::spin_loop();
+                    }
+
+                    let mut ratelimiter = RateLimiter::new(
+                        write_rate,
+                        config.writer_threads,
+                        worker_id,
+                        config.spiky,
+                    );
                     let end_time = Instant::now() + Duration::from_secs(config.runtime_seconds);
 
                     while Instant::now() < end_time {
@@ -353,6 +381,7 @@ fn main() {
 
         let statistic = SummaryStatistics::create_from_sample(&mut samples);
 
+        println!("serializing summary_file");
         //--------- Summary File
         {
             let file_exists = Path::new(&config.summary_file).exists();
@@ -372,6 +401,7 @@ fn main() {
             wtr.flush().unwrap();
         }
 
+        println!("serializing samples_file");
         //------ Sample File
         if config.serialize_samples {
             let file_exists = Path::new(&config.samples_file).exists();

@@ -3,10 +3,7 @@ settings({
 })
 
 hosts = {
-	{ ip = "genoa", port = 22 },
-	{ ip = "dm-c08", port = 22 },
-	{ ip = "dm-c07", port = 22 },
-	{ ip = "ec2-18-157-183-243.eu-central-1.compute.amazonaws.com", port = 22 },
+	{ ip = "ec2-3-143-236-1.us-east-2.compute.amazonaws.com", port = 22 },
 }
 
 local filter = {
