@@ -1,1 +1,4 @@
 /target
+uring_batching/.zig-cache
+uring_batching/zig-out
+/plot

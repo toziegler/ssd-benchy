@@ -1,0 +1,3 @@
+[submodule "uring_batching/libs/zig-liburing"]
+	path = uring_batching/libs/zig-liburing
+	url = git@github.com:fundamentalservices/zig-liburing.git
